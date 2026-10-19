@@ -20,6 +20,12 @@ dependencies = [
     "networkx>=3.7",
     "fastembed>=0.9.0",
     "flashrank>=0.2.10",
+    "langgraph>=0.2.70",
+    "langchain-core>=0.3.40",
+    "langchain-ollama>=0.2.3",
+    "langchain-openai>=0.3.7",
+    "langchain-google-genai>=2.0.0",
+    "langchain-groq>=0.2.0",
 ]
 
 [project.optional-dependencies]
