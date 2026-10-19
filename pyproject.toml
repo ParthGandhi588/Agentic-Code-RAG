@@ -15,6 +15,9 @@ dependencies = [
     "python-dotenv>=1.0.1",
     "httpx>=0.28.0",
     "pathspec>=1.1.1",
+    "tree-sitter>=0.26.0",
+    "tree-sitter-language-pack>=1.22.1",
+    "networkx>=3.7",
 ]
 
 [project.optional-dependencies]
@@ -62,4 +65,5 @@ filterwarnings = [
 [dependency-groups]
 dev = [
     "asyncpg-stubs>=0.32.0",
+    "types-networkx>=3.6.1.20261018",
 ]
