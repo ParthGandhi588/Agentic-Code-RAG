@@ -19,7 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 # Copy dependency files first for layer caching
-COPY pyproject.toml .python-version ./
+COPY pyproject.toml uv.lock* .python-version ./
 
 # Install production dependencies
 RUN uv sync --frozen --no-dev --no-install-project
