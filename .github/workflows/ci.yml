@@ -1,0 +1,64 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: test_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: ".python-version"
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Lint with Ruff
+        run: |
+          uv run ruff check src tests
+          uv run ruff format --check src tests
+
+      - name: Type check with Mypy
+        run: uv run mypy src
+
+      - name: Run Test Suite
+        env:
+          PG_HOST: localhost
+          PG_PORT: 5432
+          PG_USER: test_user
+          PG_PASSWORD: test_password
+          PG_DATABASE: test_db
+          LLM_PROVIDER: ollama
+        run: uv run pytest tests/ -v --cov=src --cov-report=xml
+
+      - name: Verify Docker Build
+        run: docker build -t agentic-code-rag:test .
