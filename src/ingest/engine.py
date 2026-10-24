@@ -154,13 +154,14 @@ class IngestionEngine:
                 and not (
                     gitignore_spec
                     and gitignore_spec.match_file(
-                        os.path.relpath(os.path.join(dirpath, d), root_path) + "/"
+                        os.path.relpath(os.path.join(dirpath, d), root_path).replace("\\", "/")
+                        + "/"
                     )
                 )
             ]
             for fname in filenames:
                 full_path = os.path.join(dirpath, fname)
-                rel_path = os.path.relpath(full_path, root_path)
+                rel_path = os.path.relpath(full_path, root_path).replace("\\", "/")
                 if gitignore_spec and gitignore_spec.match_file(rel_path):
                     continue
                 all_file_paths.append(rel_path)

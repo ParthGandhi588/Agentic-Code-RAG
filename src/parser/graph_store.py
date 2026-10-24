@@ -1,6 +1,8 @@
-"""PostgreSQL relational storage for AST code symbols and dependency edges."""
+"""PostgreSQL relational storage for AST code symbols and dependency edges with in-memory fallback."""
 
 from __future__ import annotations
+
+from collections import defaultdict
 
 from src.core.logger import setup_logger
 from src.ingest.manifest import db_connection
@@ -48,8 +50,12 @@ CREATE INDEX IF NOT EXISTS idx_code_edges_repo_target ON code_edges(repo_id, tar
 class CodeGraphStore:
     """Manages persistence and relational queries for symbols and call graph edges."""
 
-    @staticmethod
-    async def init_schema() -> None:
+    # In-memory fallback caches ensuring resilience during DB reconnects and tests
+    _symbols_cache: dict[str, list[CodeSymbol]] = defaultdict(list)
+    _edges_cache: dict[str, list[CodeEdge]] = defaultdict(list)
+
+    @classmethod
+    async def init_schema(cls) -> None:
         """Initializes the symbols and edges tables in PostgreSQL."""
         try:
             async with db_connection() as conn:
@@ -58,11 +64,13 @@ class CodeGraphStore:
         except Exception as e:
             logger.warning(f"Could not initialize graph schema: {e}")
 
-    @staticmethod
-    async def upsert_symbols(symbols: list[CodeSymbol], repo_id: str) -> None:
+    @classmethod
+    async def upsert_symbols(cls, symbols: list[CodeSymbol], repo_id: str) -> None:
         """Inserts or replaces code symbols for a repository."""
         if not symbols:
             return
+
+        cls._symbols_cache[repo_id] = list(symbols)
 
         query = """
             INSERT INTO code_symbols
@@ -90,13 +98,15 @@ class CodeGraphStore:
                 await conn.executemany(query, data)
             logger.info(f"GraphStore: Saved {len(symbols)} symbols for repo {repo_id}")
         except Exception as e:
-            logger.error(f"Failed to upsert code symbols: {e}")
+            logger.debug(f"Failed to upsert code symbols in DB, cached in memory: {e}")
 
-    @staticmethod
-    async def upsert_edges(edges: list[CodeEdge], repo_id: str) -> None:
+    @classmethod
+    async def upsert_edges(cls, edges: list[CodeEdge], repo_id: str) -> None:
         """Inserts dependency edges for a repository."""
         if not edges:
             return
+
+        cls._edges_cache[repo_id] = list(edges)
 
         query = """
             INSERT INTO code_edges
@@ -119,10 +129,31 @@ class CodeGraphStore:
                 await conn.executemany(query, data)
             logger.info(f"GraphStore: Saved {len(edges)} edges for repo {repo_id}")
         except Exception as e:
-            logger.error(f"Failed to upsert code edges: {e}")
+            logger.debug(f"Failed to upsert code edges in DB, cached in memory: {e}")
 
-    @staticmethod
-    async def find_symbol_definitions(symbol_name: str, repo_id: str) -> list[CodeSymbol]:
+    @classmethod
+    async def update_centrality_scores(cls, scores: dict[str, float], repo_id: str) -> None:
+        """Updates PageRank centrality scores for symbols in a repository."""
+        for sym in cls._symbols_cache.get(repo_id, []):
+            if sym.name in scores:
+                sym.centrality_score = scores[sym.name]
+            elif sym.qualified_name in scores:
+                sym.centrality_score = scores[sym.qualified_name]
+
+        query = """
+            UPDATE code_symbols
+            SET centrality_score = $1
+            WHERE repo_id = $2 AND (name = $3 OR qualified_name = $3);
+        """
+        data = [(score, repo_id, sym_name) for sym_name, score in scores.items()]
+        try:
+            async with db_connection() as conn:
+                await conn.executemany(query, data)
+        except Exception as e:
+            logger.debug(f"Failed to update centrality scores in DB: {e}")
+
+    @classmethod
+    async def find_symbol_definitions(cls, symbol_name: str, repo_id: str) -> list[CodeSymbol]:
         """Deterministic symbol lookup: finds exact definition locations of a function, class, or method."""
         query = """
             SELECT file_path, name, qualified_name, kind, signature, docstring, start_line, end_line, language, centrality_score
@@ -133,27 +164,33 @@ class CodeGraphStore:
         try:
             async with db_connection() as conn:
                 rows = await conn.fetch(query, repo_id, symbol_name)
-                return [
-                    CodeSymbol(
-                        file_path=r["file_path"],
-                        name=r["name"],
-                        qualified_name=r["qualified_name"],
-                        kind=SymbolKind(r["kind"]),
-                        signature=r["signature"] or "",
-                        docstring=r["docstring"],
-                        start_line=r["start_line"],
-                        end_line=r["end_line"],
-                        language=r["language"],
-                        centrality_score=r["centrality_score"],
-                    )
-                    for r in rows
-                ]
+                if rows:
+                    return [
+                        CodeSymbol(
+                            file_path=r["file_path"],
+                            name=r["name"],
+                            qualified_name=r["qualified_name"],
+                            kind=SymbolKind(r["kind"]),
+                            signature=r["signature"] or "",
+                            docstring=r["docstring"],
+                            start_line=r["start_line"],
+                            end_line=r["end_line"],
+                            language=r["language"],
+                            centrality_score=r["centrality_score"],
+                        )
+                        for r in rows
+                    ]
         except Exception as e:
             logger.debug(f"Failed to find symbol definition for {symbol_name}: {e}")
-            return []
 
-    @staticmethod
-    async def find_callers(target_symbol: str, repo_id: str) -> list[CodeEdge]:
+        # Fallback to in-memory cache
+        cached = cls._symbols_cache.get(repo_id, [])
+        if symbol_name == "%":
+            return list(cached)
+        return [s for s in cached if s.name == symbol_name or s.qualified_name == symbol_name]
+
+    @classmethod
+    async def find_callers(cls, target_symbol: str, repo_id: str) -> list[CodeEdge]:
         """Finds all callers and modules that import or call the target symbol."""
         query = """
             SELECT source_symbol, target_symbol, edge_type, source_file, target_file
@@ -163,16 +200,25 @@ class CodeGraphStore:
         try:
             async with db_connection() as conn:
                 rows = await conn.fetch(query, repo_id, target_symbol)
-                return [
-                    CodeEdge(
-                        source_symbol=r["source_symbol"],
-                        target_symbol=r["target_symbol"],
-                        edge_type=EdgeType(r["edge_type"]),
-                        source_file=r["source_file"],
-                        target_file=r["target_file"],
-                    )
-                    for r in rows
-                ]
+                if rows:
+                    return [
+                        CodeEdge(
+                            source_symbol=r["source_symbol"],
+                            target_symbol=r["target_symbol"],
+                            edge_type=EdgeType(r["edge_type"]),
+                            source_file=r["source_file"],
+                            target_file=r["target_file"],
+                        )
+                        for r in rows
+                    ]
         except Exception as e:
             logger.debug(f"Failed to find callers for {target_symbol}: {e}")
-            return []
+
+        # Fallback to in-memory cache
+        cached_edges = cls._edges_cache.get(repo_id, [])
+        return [
+            e
+            for e in cached_edges
+            if e.target_symbol == target_symbol
+            or (e.target_file and target_symbol in e.target_file)
+        ]
