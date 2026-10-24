@@ -15,6 +15,7 @@ from src.api.errors import (
     generic_exception_handler,
     validation_error_handler,
 )
+from src.api.job_manager import JobManager
 from src.api.job_store import JobStore
 from src.api.routers.chat import router as chat_router
 from src.api.routers.jobs import router as jobs_router
@@ -43,6 +44,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     yield
     logger.info("Shutting down Agentic-Code-RAG backend...")
+    await JobManager.cancel_all()
 
 
 app = FastAPI(

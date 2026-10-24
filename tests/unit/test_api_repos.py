@@ -1,6 +1,7 @@
 """Unit tests for repository lifecycle, graph explorer, and file inspection endpoints."""
 
 import os
+from unittest.mock import patch
 
 import pytest
 from httpx import AsyncClient
@@ -18,12 +19,13 @@ async def test_init_repo_endpoint(async_client: AsyncClient) -> None:
         "source_type": "local",
         "source_path": os.getcwd(),
     }
-    response = await async_client.post("/api/repos/init", json=payload)
-    assert response.status_code == 202
-    data = response.json()
-    assert data["repo_id"] == "test-sample-service"
-    assert data["status"] == "queued"
-    assert "job_id" in data
+    with patch("src.api.job_manager.JobManager._run_indexing_pipeline"):
+        response = await async_client.post("/api/repos/init", json=payload)
+        assert response.status_code == 202
+        data = response.json()
+        assert data["repo_id"] == "test-sample-service"
+        assert data["status"] == "queued"
+        assert "job_id" in data
 
 
 @pytest.mark.asyncio

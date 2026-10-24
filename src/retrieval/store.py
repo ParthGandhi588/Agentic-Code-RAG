@@ -54,7 +54,7 @@ class VectorStore:
         query = """
             INSERT INTO code_chunks
                 (repo_id, file_path, start_line, end_line, language, content, embedding)
-            VALUES ($1, $2, $3, $4, $5, $6, $7::real[]);
+            VALUES ($1, $2, $3, $4, $5, $6, $7::text::vector);
         """
         data = [
             (
@@ -64,7 +64,7 @@ class VectorStore:
                 c.end_line,
                 c.language,
                 c.content,
-                c.embedding,
+                str(c.embedding),
             )
             for c in chunks
             if c.embedding is not None
@@ -83,15 +83,15 @@ class VectorStore:
         """Cosine distance vector search via pgvector HNSW index."""
         query = """
             SELECT id, file_path, start_line, end_line, language, content,
-                   1 - (embedding <=> $1::real[]) AS similarity_score
+                   1 - (embedding <=> $1::text::vector) AS similarity_score
             FROM code_chunks
             WHERE repo_id = $2
-            ORDER BY embedding <=> $1::real[]
+            ORDER BY embedding <=> $1::text::vector
             LIMIT $3;
         """
         try:
             async with db_connection() as conn:
-                rows = await conn.fetch(query, query_vec, repo_id, limit)
+                rows = await conn.fetch(query, str(query_vec), repo_id, limit)
                 return [
                     SearchResult(
                         chunk_id=r["id"],

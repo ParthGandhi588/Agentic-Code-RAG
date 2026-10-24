@@ -65,6 +65,17 @@ class JobManager:
         return job
 
     @classmethod
+    async def cancel_all(cls) -> None:
+        """Cancels all active background tasks."""
+        tasks = list(cls._active_tasks.values())
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        cls._active_tasks.clear()
+
+    @classmethod
     async def subscribe(cls, job_id: str) -> AsyncGenerator[IndexingJobResponse, None]:
         """Subscribes an SSE connection to live progress updates for an indexing job."""
         queue: asyncio.Queue[IndexingJobResponse] = asyncio.Queue()
