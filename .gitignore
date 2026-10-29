@@ -57,3 +57,4 @@ Thumbs.db
 # Temporary Repositories & Scratch
 temp_repos/
 scratch/
+.rag_cache/

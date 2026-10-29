@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
 import asyncpg
 
 from src.core.config import get_settings
+from src.core.disk_cache import load_cache, save_cache
 from src.core.logger import setup_logger
 from src.ingest.models import ScannedFile
 
@@ -15,21 +17,35 @@ logger = setup_logger("agentic-manifest")
 settings = get_settings()
 
 _pool: asyncpg.Pool | None = None
+_db_offline: bool = False
+_last_db_error_time: float = 0.0
 
 
 async def get_db_pool() -> asyncpg.Pool:
-    """Initializes and returns the shared asyncpg connection pool."""
-    global _pool
+    """Initializes and returns the shared asyncpg connection pool with fail-fast offline resilience."""
+    global _pool, _db_offline, _last_db_error_time
+    if _db_offline and (time.time() - _last_db_error_time < 30.0):
+        raise ConnectionError("PostgreSQL database is currently offline.")
+
     if _pool is None:
-        _pool = await asyncpg.create_pool(
-            host=settings.pg_host,
-            port=settings.pg_port,
-            user=settings.pg_user,
-            password=settings.pg_password,
-            database=settings.pg_database,
-            min_size=2,
-            max_size=10,
-        )
+        try:
+            _pool = await asyncpg.create_pool(
+                host=settings.pg_host,
+                port=settings.pg_port,
+                user=settings.pg_user,
+                password=settings.pg_password,
+                database=settings.pg_database,
+                min_size=1,
+                max_size=10,
+                timeout=1.0,
+                command_timeout=3.0,
+            )
+            _db_offline = False
+        except Exception as e:
+            _db_offline = True
+            _last_db_error_time = time.time()
+            logger.debug(f"PostgreSQL connection failed ({e}), enabling in-memory fallback.")
+            raise
     return _pool
 
 
@@ -61,7 +77,10 @@ CREATE INDEX IF NOT EXISTS idx_indexed_files_hash ON indexed_files(blob_hash);
 
 
 class ManifestStore:
-    """PostgreSQL storage manager for repository manifest records."""
+    """PostgreSQL storage manager for repository manifest records with in-memory fallback."""
+
+    _manifest_cache: dict[str, dict[str, tuple[str, float | None]]] = {}
+    _commit_cache: dict[str, str | None] = {}
 
     @staticmethod
     async def init_schema() -> None:
@@ -73,8 +92,8 @@ class ManifestStore:
         except Exception as e:
             logger.warning(f"Could not initialize manifest schema (DB might be offline): {e}")
 
-    @staticmethod
-    async def get_last_indexed_commit(repo_id: str) -> str | None:
+    @classmethod
+    async def get_last_indexed_commit(cls, repo_id: str) -> str | None:
         """Returns the most recent commit SHA recorded for this repo."""
         query = """
             SELECT commit_sha FROM indexed_files
@@ -84,13 +103,17 @@ class ManifestStore:
         try:
             async with db_connection() as conn:
                 val = await conn.fetchval(query, repo_id)
-                return str(val) if val else None
+                commit = str(val) if val else None
+                cls._commit_cache[repo_id] = commit
+                return commit
         except Exception as e:
             logger.debug(f"Failed to fetch last commit for {repo_id}: {e}")
-            return None
+            if repo_id not in cls._commit_cache:
+                cls._commit_cache[repo_id] = load_cache(f"{repo_id}_commit")
+            return cls._commit_cache.get(repo_id)
 
-    @staticmethod
-    async def load_indexed_hashes(repo_id: str) -> dict[str, tuple[str, float | None]]:
+    @classmethod
+    async def load_indexed_hashes(cls, repo_id: str) -> dict[str, tuple[str, float | None]]:
         """Returns { file_path: (blob_hash, mtime) } mapping for an indexed repository."""
         query = """
             SELECT file_path, blob_hash, mtime FROM indexed_files
@@ -99,18 +122,34 @@ class ManifestStore:
         try:
             async with db_connection() as conn:
                 rows = await conn.fetch(query, repo_id)
-                return {row["file_path"]: (row["blob_hash"], row["mtime"]) for row in rows}
+                data = {row["file_path"]: (row["blob_hash"], row["mtime"]) for row in rows}
+                cls._manifest_cache[repo_id] = data
+                return data
         except Exception as e:
             logger.debug(f"Failed to load hashes for {repo_id}: {e}")
-            return {}
+            if repo_id not in cls._manifest_cache or not cls._manifest_cache[repo_id]:
+                disk_data = load_cache(f"{repo_id}_manifest")
+                if disk_data:
+                    cls._manifest_cache[repo_id] = {k: tuple(v) for k, v in disk_data.items()}
+            return cls._manifest_cache.get(repo_id, {})
 
-    @staticmethod
+    @classmethod
     async def upsert_records(
-        records: list[ScannedFile], repo_id: str, commit_sha: str | None = None
+        cls, records: list[ScannedFile], repo_id: str, commit_sha: str | None = None
     ) -> None:
         """Bulk upserts scanned files into the manifest table."""
         if not records:
             return
+
+        # Always update in-memory and disk fallback
+        if repo_id not in cls._manifest_cache:
+            cls._manifest_cache[repo_id] = {}
+        for rec in records:
+            cls._manifest_cache[repo_id][rec.file_path] = (rec.blob_hash, rec.mtime)
+        save_cache(f"{repo_id}_manifest", cls._manifest_cache[repo_id])
+        if commit_sha:
+            cls._commit_cache[repo_id] = commit_sha
+            save_cache(f"{repo_id}_commit", commit_sha)
 
         query = """
             INSERT INTO indexed_files
@@ -141,13 +180,17 @@ class ManifestStore:
                 await conn.executemany(query, data)
             logger.info(f"Manifest: Upserted {len(records)} records for repo {repo_id}")
         except Exception as e:
-            logger.error(f"Failed to upsert manifest records: {e}")
+            logger.debug(f"Failed to upsert manifest records into DB (using cache): {e}")
 
-    @staticmethod
-    async def delete_records(file_paths: list[str], repo_id: str) -> None:
+    @classmethod
+    async def delete_records(cls, file_paths: list[str], repo_id: str) -> None:
         """Removes manifest records for deleted files."""
         if not file_paths:
             return
+        if repo_id in cls._manifest_cache:
+            for p in file_paths:
+                cls._manifest_cache[repo_id].pop(p, None)
+
         query = """
             DELETE FROM indexed_files
             WHERE repo_id = $1 AND file_path = ANY($2::text[]);
@@ -157,4 +200,4 @@ class ManifestStore:
                 await conn.execute(query, repo_id, file_paths)
             logger.info(f"Manifest: Deleted {len(file_paths)} records for repo {repo_id}")
         except Exception as e:
-            logger.error(f"Failed to delete manifest records: {e}")
+            logger.debug(f"Failed to delete manifest records from DB (using cache): {e}")

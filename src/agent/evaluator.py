@@ -112,7 +112,7 @@ class CRAGEvaluator:
 
     async def aevaluate(self, query: str, context: str) -> CRAGEvaluation:
         """Asynchronously grades the retrieved context using an LLM if available, falling back to heuristics."""
-        if self.llm is None:
+        if self.llm is None or "Ollama" in self.llm.__class__.__name__:
             return self.heuristic_evaluate(query=query, context=context)
 
         prompt_str = CRAG_EVALUATOR_PROMPT.format(query=query, context=context[:4000])
@@ -126,7 +126,13 @@ class CRAGEvaluator:
                 HumanMessage(content=prompt_str),
             ]
             response = await self.llm.ainvoke(messages)
-            content = str(response.content)
+            if isinstance(response.content, list):
+                content = "".join(
+                    b.get("text", "") if isinstance(b, dict) else str(b)
+                    for b in response.content
+                )
+            else:
+                content = str(response.content)
 
             # Extract JSON block if wrapped in markdown
             json_match = re.search(r"\{.*\}", content, re.DOTALL)

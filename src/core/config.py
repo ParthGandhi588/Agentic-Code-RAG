@@ -31,11 +31,11 @@ class Settings(BaseSettings):
 
     # Google Gemini
     google_api_key: str | None = Field(default=None, alias="GOOGLE_API_KEY")
-    gemini_model: str = Field(default="gemini-2.5-flash", alias="GEMINI_MODEL")
+    gemini_model: str = Field(default="gemini-3.5-flash", alias="GEMINI_MODEL")
 
     # Groq
     groq_api_key: str | None = Field(default=None, alias="GROQ_API_KEY")
-    groq_model: str = Field(default="llama-3.3-70b-versatile", alias="GROQ_MODEL")
+    groq_model: str = Field(default="qwen/qwen3.8-27b", alias="GROQ_MODEL")
 
     # Ollama
     ollama_base_url: str = Field(default="http://localhost:11434", alias="OLLAMA_BASE_URL")

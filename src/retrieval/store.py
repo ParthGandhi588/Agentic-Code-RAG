@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from src.core.disk_cache import load_cache, save_cache
 from src.core.logger import setup_logger
 from src.ingest.manifest import db_connection
 from src.retrieval.models import ChunkRecord, SearchResult
@@ -33,7 +34,9 @@ CREATE INDEX IF NOT EXISTS idx_code_chunks_embedding
 
 
 class VectorStore:
-    """Unified PostgreSQL storage for vector embeddings and lexical tsvectors."""
+    """Unified PostgreSQL storage for vector embeddings and lexical tsvectors with in-memory fallback."""
+
+    _chunks_cache: dict[str, list[ChunkRecord]] = {}
 
     @staticmethod
     async def init_schema() -> None:
@@ -43,13 +46,28 @@ class VectorStore:
                 await conn.execute(SCHEMA_SQL)
             logger.info("VectorStore schema initialized successfully.")
         except Exception as e:
-            logger.warning(f"Could not initialize vector store schema: {e}")
+            logger.warning(f"Could not initialize vector store schema (DB offline): {e}")
 
-    @staticmethod
-    async def upsert_chunks(chunks: list[ChunkRecord], repo_id: str) -> None:
+    @classmethod
+    def _ensure_chunks_loaded(cls, repo_id: str) -> None:
+        """Loads chunks from disk cache if in-memory cache is empty."""
+        if repo_id not in cls._chunks_cache or not cls._chunks_cache[repo_id]:
+            disk_data = load_cache(f"{repo_id}_chunks")
+            if disk_data:
+                cls._chunks_cache[repo_id] = [ChunkRecord(**item) for item in disk_data]
+                logger.info(f"VectorStore: Restored {len(cls._chunks_cache[repo_id])} chunks from disk cache for {repo_id}")
+
+    @classmethod
+    async def upsert_chunks(cls, chunks: list[ChunkRecord], repo_id: str) -> None:
         """Inserts code chunks and their embeddings into PostgreSQL."""
         if not chunks:
             return
+
+        # Always update in-memory and disk cache
+        if repo_id not in cls._chunks_cache:
+            cls._chunks_cache[repo_id] = []
+        cls._chunks_cache[repo_id].extend(chunks)
+        save_cache(f"{repo_id}_chunks", [c.model_dump() for c in cls._chunks_cache[repo_id]])
 
         query = """
             INSERT INTO code_chunks
@@ -74,13 +92,13 @@ class VectorStore:
                 await conn.executemany(query, data)
             logger.info(f"VectorStore: Indexed {len(data)} chunks for repo '{repo_id}'")
         except Exception as e:
-            logger.error(f"Failed to insert vector chunks: {e}")
+            logger.debug(f"Failed to insert vector chunks into DB (cached in memory/disk): {e}")
 
-    @staticmethod
+    @classmethod
     async def dense_search(
-        query_vec: list[float], repo_id: str, limit: int = 30
+        cls, query_vec: list[float], repo_id: str, limit: int = 30
     ) -> list[SearchResult]:
-        """Cosine distance vector search via pgvector HNSW index."""
+        """Cosine distance vector search via pgvector HNSW index with in-memory fallback."""
         query = """
             SELECT id, file_path, start_line, end_line, language, content,
                    1 - (embedding <=> $1::text::vector) AS similarity_score
@@ -105,12 +123,32 @@ class VectorStore:
                     for r in rows
                 ]
         except Exception as e:
-            logger.debug(f"Dense vector search failed: {e}")
-            return []
+            logger.debug(f"Dense vector DB search failed (using memory/disk cache): {e}")
+            cls._ensure_chunks_loaded(repo_id)
+            cached = cls._chunks_cache.get(repo_id, [])
+            scored: list[SearchResult] = []
+            for idx, c in enumerate(cached):
+                if c.embedding:
+                    sim = sum(a * b for a, b in zip(query_vec, c.embedding, strict=False))
+                    scored.append(
+                        SearchResult(
+                            chunk_id=idx + 1,
+                            file_path=c.file_path,
+                            start_line=c.start_line,
+                            end_line=c.end_line,
+                            language=c.language,
+                            content=c.content,
+                            dense_score=float(sim),
+                        )
+                    )
+            scored.sort(key=lambda s: s.dense_score or 0.0, reverse=True)
+            return scored[:limit]
 
-    @staticmethod
-    async def sparse_search(query_text: str, repo_id: str, limit: int = 30) -> list[SearchResult]:
-        """Lexical BM25 search via PostgreSQL tsvector and GIN index."""
+    @classmethod
+    async def sparse_search(
+        cls, query_text: str, repo_id: str, limit: int = 30
+    ) -> list[SearchResult]:
+        """Lexical BM25 search via PostgreSQL tsvector with in-memory fallback."""
         query = """
             SELECT id, file_path, start_line, end_line, language, content,
                    ts_rank_cd(tsv_content, plainto_tsquery('english', $1)) AS bm25_score
@@ -135,5 +173,24 @@ class VectorStore:
                     for r in rows
                 ]
         except Exception as e:
-            logger.debug(f"Sparse lexical search failed: {e}")
-            return []
+            logger.debug(f"Sparse lexical DB search failed (using memory/disk cache): {e}")
+            cls._ensure_chunks_loaded(repo_id)
+            terms = [t.lower() for t in query_text.split() if len(t) > 2]
+            cached = cls._chunks_cache.get(repo_id, [])
+            scored: list[SearchResult] = []
+            for idx, c in enumerate(cached):
+                cnt = sum(c.content.lower().count(t) for t in terms)
+                if cnt > 0:
+                    scored.append(
+                        SearchResult(
+                            chunk_id=idx + 1,
+                            file_path=c.file_path,
+                            start_line=c.start_line,
+                            end_line=c.end_line,
+                            language=c.language,
+                            content=c.content,
+                            sparse_score=float(cnt),
+                        )
+                    )
+            scored.sort(key=lambda s: s.sparse_score or 0.0, reverse=True)
+            return scored[:limit]

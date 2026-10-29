@@ -38,6 +38,41 @@ def should_continue(state: AgentState) -> Literal["tools", "answer_node"]:
     tool_calls = getattr(last_message, "tool_calls", None)
 
     if tool_calls and len(tool_calls) > 0:
+        # Detect duplicate tool call loops across prior messages using normalized signatures
+        import json
+
+        def _tool_sig(tc: dict[str, Any]) -> str:
+            name = tc.get("name", "")
+            args = tc.get("args", {})
+            if not isinstance(args, dict):
+                return f"{name}:{str(args)}"
+            repo = str(args.get("repo_id", "")).strip()
+            if name == "hybrid_code_search":
+                q = str(args.get("query", "")).strip().lower()
+                return f"{name}:{repo}:{q}"
+            elif name in ("find_symbol_definitions", "find_symbol_references"):
+                s = str(args.get("symbol_name", "")).strip().lower()
+                return f"{name}:{repo}:{s}"
+            elif name == "read_file_range":
+                fp = str(args.get("file_path", "")).strip().lower()
+                sl = args.get("start_line", 1)
+                return f"{name}:{repo}:{fp}:{sl}"
+            elif name == "inspect_repo_map":
+                return f"{name}:{repo}"
+            return f"{name}:{json.dumps(args, sort_keys=True)}"
+
+        executed_sigs: set[str] = set()
+        for m in messages[:-1]:
+            tc_list = getattr(m, "tool_calls", None)
+            if tc_list:
+                for tc in tc_list:
+                    executed_sigs.add(_tool_sig(tc))
+
+        current_sigs = [_tool_sig(tc) for tc in tool_calls]
+        if any(sig in executed_sigs for sig in current_sigs):
+            logger.info("Detected duplicate tool call already executed in history. Breaking loop and routing to answer_node.")
+            return "answer_node"
+
         return "tools"
 
     return "answer_node"
@@ -52,7 +87,7 @@ def post_tools_routing(state: AgentState) -> Literal["crag_evaluator", "agent"]:
         if tool_calls:
             for tc in tool_calls:
                 name = tc.get("name", "")
-                if name in ("hybrid_code_search", "find_symbol_definitions"):
+                if name in ("hybrid_code_search", "find_symbol_definitions", "read_file_range"):
                     return "crag_evaluator"
             break
     return "agent"
@@ -88,7 +123,7 @@ def build_code_rag_graph(
     """
     # Bind tools to the model
     llm_with_tools = llm.bind_tools(ALL_AGENT_TOOLS)
-    nodes = AgentNodes(llm=llm_with_tools)
+    nodes = AgentNodes(llm=llm_with_tools, raw_llm=llm)
 
     workflow = StateGraph(AgentState)
 

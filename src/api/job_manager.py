@@ -303,7 +303,7 @@ class JobManager:
 
             if all_chunks:
                 chunk_texts = [c.content for c in all_chunks]
-                embeddings = FastEmbedder.embed_documents(chunk_texts)
+                embeddings = await asyncio.to_thread(FastEmbedder.embed_documents, chunk_texts)
                 for c, emb in zip(all_chunks, embeddings, strict=True):
                     c.embedding = emb
 

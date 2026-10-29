@@ -23,7 +23,7 @@ from src.api.schemas import (
 )
 from src.core.config import get_settings
 from src.core.logger import setup_logger
-from src.ingest.manifest import db_connection
+from src.ingest.manifest import ManifestStore, db_connection
 from src.parser.graph_store import CodeGraphStore
 
 router = APIRouter(prefix="/api/repos", tags=["Repositories"])
@@ -104,22 +104,49 @@ async def list_repositories() -> RepoListResponse:
     except Exception as e:
         logger.debug(f"DB aggregation for list_repositories failed (DB may be offline): {e}")
 
-    # If DB returned nothing or is offline, check cached jobs
+    # If DB returned nothing or is offline, check cached jobs or disk cache
     if not repos:
+        from pathlib import Path
+        cache_dir = Path(".rag_cache")
+        seen: set[str] = set()
+
+        # Check in-memory JobStore jobs
         cached_jobs = JobStore._memory_cache.values()
-        seen = set()
         for j in cached_jobs:
             if j.repo_id not in seen:
                 seen.add(j.repo_id)
+                syms = CodeGraphStore._symbols_cache.get(j.repo_id, [])
+                files = ManifestStore._manifest_cache.get(j.repo_id, {})
+                langs = sorted({s.language for s in syms if s.language})
+                total_files = len(files) if files else len({s.file_path for s in syms})
                 repos.append(
                     RepoSummary(
                         repo_id=j.repo_id,
-                        total_files=0,
-                        languages=[],
-                        total_symbols=0,
+                        total_files=total_files,
+                        languages=langs,
+                        total_symbols=len(syms),
                         last_indexed_at=j.updated_at,
                     )
                 )
+
+        # Check disk cache .rag_cache/*_manifest.json
+        if cache_dir.is_dir():
+            for mf in cache_dir.glob("*_manifest.json"):
+                r_id = mf.stem.removesuffix("_manifest")
+                if r_id and r_id not in seen and not r_id.startswith("test_"):
+                    seen.add(r_id)
+                    syms = await CodeGraphStore.find_symbol_definitions(symbol_name="%", repo_id=r_id)
+                    files = await ManifestStore.load_indexed_hashes(repo_id=r_id)
+                    langs = sorted({s.language for s in syms if s.language})
+                    total_files = len(files) if files else len({s.file_path for s in syms})
+                    repos.append(
+                        RepoSummary(
+                            repo_id=r_id,
+                            total_files=total_files,
+                            languages=langs,
+                            total_symbols=len(syms),
+                        )
+                    )
 
     return RepoListResponse(repositories=repos)
 
@@ -227,6 +254,44 @@ async def get_repo_graph(repo_id: str) -> RepoGraphResponse:
                 )
     except Exception as e:
         logger.debug(f"Failed to fetch repo graph from DB for {repo_id}: {e}")
+
+    # Fallback to in-memory graph cache if DB is offline or returned no rows
+    if not nodes and repo_id in CodeGraphStore._symbols_cache:
+        cached_syms = sorted(
+            CodeGraphStore._symbols_cache[repo_id],
+            key=lambda s: s.centrality_score,
+            reverse=True,
+        )[:150]
+        for s in cached_syms:
+            nodes.append(
+                GraphNode(
+                    id=f"{s.file_path}:{s.name}",
+                    name=s.name,
+                    kind=str(s.kind),
+                    file_path=s.file_path,
+                    line=s.start_line,
+                    pagerank_score=s.centrality_score,
+                )
+            )
+        cached_edges = CodeGraphStore._edges_cache.get(repo_id, [])[:300]
+        for edge in cached_edges:
+            s_id = (
+                f"{edge.source_file}:{edge.source_symbol}"
+                if edge.source_file
+                else edge.source_symbol
+            )
+            t_id = (
+                f"{edge.target_file}:{edge.target_symbol}"
+                if edge.target_file
+                else edge.target_symbol
+            )
+            edges.append(
+                GraphEdge(
+                    source=s_id,
+                    target=t_id,
+                    edge_type=str(edge.edge_type),
+                )
+            )
 
     return RepoGraphResponse(repo_id=repo_id, nodes=nodes, edges=edges)
 

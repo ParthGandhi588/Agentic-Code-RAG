@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from collections.abc import AsyncGenerator
 
 from fastapi import APIRouter, status
@@ -40,7 +41,7 @@ async def chat_with_agent(payload: ChatRequest) -> StreamingResponse:
     """Invokes the LangGraph agent state machine and streams events via SSE."""
     repo_id = payload.repo_id
     query = payload.message
-    thread_id = payload.thread_id or f"thread_{repo_id}"
+    thread_id = payload.thread_id or f"thread_{repo_id}_{uuid.uuid4().hex[:8]}"
 
     # Verify repository has indexed symbols or files
     symbols = await CodeGraphStore.find_symbol_definitions(symbol_name="%", repo_id=repo_id)
@@ -51,10 +52,19 @@ async def chat_with_agent(payload: ChatRequest) -> StreamingResponse:
             top_symbols
         )
 
-    agent = get_agent()
-
     async def sse_event_stream() -> AsyncGenerator[str, None]:
         try:
+            try:
+                agent = get_agent()
+            except Exception as e:
+                err_msg = (
+                    f"LLM initialization failed: {e}. "
+                    "Please set your GOOGLE_API_KEY, GROQ_API_KEY, or run local Ollama in your environment or .env file."
+                )
+                logger.error(err_msg)
+                yield f"event: error\ndata: {json.dumps({'error': err_msg, 'thread_id': thread_id})}\n\n"
+                return
+
             logger.info(f"Initiating agent reasoning for repo '{repo_id}' on thread '{thread_id}'.")
             async for ev in stream_agent_events(
                 agent=agent,

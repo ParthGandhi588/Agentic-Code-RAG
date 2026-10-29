@@ -76,7 +76,7 @@ async def test_stream_job_sse_endpoint(async_client: AsyncClient) -> None:
     job_id = "stream-job-001"
     await JobStore.create_job(job_id=job_id, repo_id="stream-repo")
 
-    async def emit_completion():
+    async def emit_completion() -> None:
         await asyncio.sleep(0.05)
         await JobManager._emit_progress(
             job_id=job_id,

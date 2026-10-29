@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 
+from src.core.disk_cache import load_cache, save_cache
 from src.core.logger import setup_logger
 from src.ingest.manifest import db_connection
 from src.parser.models import CodeEdge, CodeSymbol, EdgeType, SymbolKind
@@ -71,6 +72,7 @@ class CodeGraphStore:
             return
 
         cls._symbols_cache[repo_id] = list(symbols)
+        save_cache(f"{repo_id}_symbols", [s.model_dump() for s in symbols])
 
         query = """
             INSERT INTO code_symbols
@@ -98,7 +100,7 @@ class CodeGraphStore:
                 await conn.executemany(query, data)
             logger.info(f"GraphStore: Saved {len(symbols)} symbols for repo {repo_id}")
         except Exception as e:
-            logger.debug(f"Failed to upsert code symbols in DB, cached in memory: {e}")
+            logger.debug(f"Failed to upsert code symbols in DB, cached in memory/disk: {e}")
 
     @classmethod
     async def upsert_edges(cls, edges: list[CodeEdge], repo_id: str) -> None:
@@ -107,6 +109,7 @@ class CodeGraphStore:
             return
 
         cls._edges_cache[repo_id] = list(edges)
+        save_cache(f"{repo_id}_edges", [e.model_dump() for e in edges])
 
         query = """
             INSERT INTO code_edges
@@ -129,7 +132,7 @@ class CodeGraphStore:
                 await conn.executemany(query, data)
             logger.info(f"GraphStore: Saved {len(edges)} edges for repo {repo_id}")
         except Exception as e:
-            logger.debug(f"Failed to upsert code edges in DB, cached in memory: {e}")
+            logger.debug(f"Failed to upsert code edges in DB, cached in memory/disk: {e}")
 
     @classmethod
     async def update_centrality_scores(cls, scores: dict[str, float], repo_id: str) -> None:
@@ -139,6 +142,9 @@ class CodeGraphStore:
                 sym.centrality_score = scores[sym.name]
             elif sym.qualified_name in scores:
                 sym.centrality_score = scores[sym.qualified_name]
+
+        if repo_id in cls._symbols_cache:
+            save_cache(f"{repo_id}_symbols", [s.model_dump() for s in cls._symbols_cache[repo_id]])
 
         query = """
             UPDATE code_symbols
@@ -183,11 +189,44 @@ class CodeGraphStore:
         except Exception as e:
             logger.debug(f"Failed to find symbol definition for {symbol_name}: {e}")
 
-        # Fallback to in-memory cache
+        # Fallback to in-memory/disk cache
+        if repo_id not in cls._symbols_cache or not cls._symbols_cache[repo_id]:
+            disk_data = load_cache(f"{repo_id}_symbols")
+            if disk_data:
+                cls._symbols_cache[repo_id] = [CodeSymbol(**item) for item in disk_data]
+
         cached = cls._symbols_cache.get(repo_id, [])
         if symbol_name == "%":
             return list(cached)
-        return [s for s in cached if s.name == symbol_name or s.qualified_name == symbol_name]
+
+        # 1. Exact match
+        exact = [s for s in cached if s.name == symbol_name or s.qualified_name == symbol_name]
+        if exact:
+            return exact
+
+        # 2. Cleaned name match (strips quotes, parens, prefixes)
+        clean_name = (
+            symbol_name.strip()
+            .strip("\"'")
+            .removesuffix("()")
+            .removeprefix("class ")
+            .removeprefix("def ")
+            .strip()
+        )
+        cleaned_matches = [
+            s for s in cached if s.name == clean_name or s.qualified_name == clean_name
+        ]
+        if cleaned_matches:
+            return cleaned_matches
+
+        # 3. Case-insensitive and qualified suffix match
+        lower_clean = clean_name.lower()
+        return [
+            s
+            for s in cached
+            if s.name.lower() == lower_clean
+            or s.qualified_name.lower().endswith("." + lower_clean)
+        ]
 
     @classmethod
     async def find_callers(cls, target_symbol: str, repo_id: str) -> list[CodeEdge]:
@@ -214,7 +253,12 @@ class CodeGraphStore:
         except Exception as e:
             logger.debug(f"Failed to find callers for {target_symbol}: {e}")
 
-        # Fallback to in-memory cache
+        # Fallback to in-memory/disk cache
+        if repo_id not in cls._edges_cache or not cls._edges_cache[repo_id]:
+            disk_data = load_cache(f"{repo_id}_edges")
+            if disk_data:
+                cls._edges_cache[repo_id] = [CodeEdge(**item) for item in disk_data]
+
         cached_edges = cls._edges_cache.get(repo_id, [])
         return [
             e

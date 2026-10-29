@@ -36,6 +36,8 @@ def get_chat_llm(
             model=model_name or settings.ollama_model,
             base_url=settings.ollama_base_url,
             temperature=temperature,
+            num_ctx=4096,
+            num_thread=8,
         )
 
     elif prov == "gemini":
@@ -51,11 +53,65 @@ def get_chat_llm(
         from langchain_groq import ChatGroq
 
         secret_key = SecretStr(settings.groq_api_key) if settings.groq_api_key else None
-        return ChatGroq(
-            model=model_name or settings.groq_model,
+        primary_model = model_name or settings.groq_model
+        primary = ChatGroq(
+            model=primary_model,
             api_key=secret_key,
             temperature=temperature,
+            max_retries=3,
         )
+
+        fallbacks: list[BaseChatModel] = []
+        if secret_key:
+            # Fallback 1: Alternate Groq model with independent token bucket
+            secondary_model = (
+                "openai/gpt-oss-20b"
+                if primary_model != "openai/gpt-oss-20b"
+                else "qwen/qwen3.8-27b"
+            )
+            fallbacks.append(
+                ChatGroq(
+                    model=secondary_model,
+                    api_key=secret_key,
+                    temperature=temperature,
+                    max_retries=2,
+                )
+            )
+
+        # Fallback 2: Google Gemini (if API key available)
+        if settings.google_api_key:
+            try:
+                from langchain_google_genai import ChatGoogleGenerativeAI
+
+                fallbacks.append(
+                    ChatGoogleGenerativeAI(
+                        model=settings.gemini_model,
+                        google_api_key=settings.google_api_key,
+                        temperature=temperature,
+                    )
+                )
+            except Exception:
+                pass
+
+        # Fallback 3: Local Ollama (always available offline)
+        try:
+            from langchain_ollama import ChatOllama
+
+            fallbacks.append(
+                ChatOllama(
+                    model=settings.ollama_model,
+                    base_url=settings.ollama_base_url,
+                    temperature=temperature,
+                    num_ctx=4096,
+                    num_thread=8,
+                )
+            )
+        except Exception:
+            pass
+
+        if fallbacks:
+            return primary.with_fallbacks(fallbacks)
+        return primary
 
     elif prov == "openai":
         from langchain_openai import ChatOpenAI
@@ -103,14 +159,28 @@ async def stream_agent_events(
 
     config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
 
+    answer_tokens_emitted = 0
+
     async for event in agent.astream_events(initial_state, config=config, version="v2"):
         event_kind = event.get("event")
+        metadata = event.get("metadata", {})
+        node_name = metadata.get("langgraph_node", "")
 
         # Stream LLM generation tokens
         if event_kind == "on_chat_model_stream":
             chunk = event.get("data", {}).get("chunk")
             if chunk and getattr(chunk, "content", None):
-                yield {"event": "token", "content": chunk.content}
+                raw_c = chunk.content
+                if isinstance(raw_c, list):
+                    text_c = "".join(b.get("text", "") if isinstance(b, dict) else str(b) for b in raw_c)
+                else:
+                    text_c = str(raw_c)
+                if text_c:
+                    if node_name == "answer_node":
+                        answer_tokens_emitted += 1
+                        yield {"event": "token", "content": text_c}
+                    elif node_name == "agent":
+                        yield {"event": "thought_token", "content": text_c}
 
         # Stream Tool start events
         elif event_kind == "on_tool_start":
@@ -124,3 +194,12 @@ async def stream_agent_events(
             tool_output = event.get("data", {}).get("output", "")
             preview = str(tool_output)[:500]
             yield {"event": "tool_end", "tool": tool_name, "output_preview": preview}
+
+        # Handle answer_node completion fallback if streaming had 0 tokens
+        elif event_kind == "on_chain_end" and event.get("name") == "answer_node":
+            output = event.get("data", {}).get("output", {})
+            if isinstance(output, dict) and output.get("final_answer"):
+                final_text = str(output["final_answer"])
+                if answer_tokens_emitted == 0:
+                    yield {"event": "token", "content": final_text}
+                yield {"event": "final_answer", "answer": final_text}
